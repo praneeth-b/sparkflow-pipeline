@@ -189,7 +189,6 @@ cython_debug/
 # .vscode/
 
 
-data/
 # Ruff stuff:
 .ruff_cache/
 

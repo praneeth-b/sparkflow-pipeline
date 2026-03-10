@@ -8,19 +8,14 @@ x-airflow-common:
     AIRFLOW__CORE__FERNET_KEY: 46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
     AIRFLOW__WEBSERVER__SECRET_KEY: 46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
     AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
-
-    # Strictly enforce the 'spark://' prefix. Renamed host to 'spark' to avoid hyphen DNS issues.
     AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark://spark:7077"}'
-
-    # Explicitly define SPARK_HOME so the Airflow worker can find the spark-submit binaries
     SPARK_HOME: /home/airflow/.local/lib/python3.12/site-packages/pyspark
-
-    # Force the Spark Driver (Airflow) to advertise its exact hostname to the workers
+    SPARK_SCALA_VERSION: "2.12"
     SPARK_LOCAL_HOSTNAME: airflow-scheduler
-
-    # Force Java on Apple Silicon to use IPv4 for DNS resolution to prevent UnknownHostException
     SPARK_SUBMIT_OPTS: "-Djava.net.preferIPv4Stack=true"
-
+    PYSPARK_PYTHON: python3
+    PYSPARK_DRIVER_PYTHON: python3
+    PYTHONPATH: /home/airflow/.local/lib/python3.12/site-packages
   volumes:
     - ./dags:/opt/airflow/dags
     - ./src:/opt/airflow/src
@@ -30,7 +25,8 @@ x-airflow-common:
       condition: service_healthy
 
 services:
-  # --- Airflow Core ---
+
+  # ── Postgres ─────────────────────────────────────────────────────────────────
   postgres:
     image: postgres:13
     container_name: postgres
@@ -48,6 +44,30 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  # ── Airflow init (runs db migrate + creates admin user, then exits) ───────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com
+    restart: "no"
+    networks:
+      - olist_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── Airflow webserver ─────────────────────────────────────────────────────────
   airflow-webserver:
     <<: *airflow-common
     container_name: airflow-webserver
@@ -65,9 +85,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
       spark:
         condition: service_started
 
+  # ── Airflow scheduler ─────────────────────────────────────────────────────────
   airflow-scheduler:
     <<: *airflow-common
     container_name: airflow-scheduler
@@ -79,32 +102,42 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
       spark:
         condition: service_started
 
-  # --- Spark Cluster ---
+  # ── Spark master ──────────────────────────────────────────────────────────────
   spark:
     build: .
     container_name: spark
     restart: always
-    entrypoint: [] # <-- Added to bypass the Airflow entrypoint
+    entrypoint: []
     environment:
-      SPARK_DAEMON_JAVA_OPTS: "-Djava.net.preferIPv4Stack=true"
       SPARK_HOME: /home/airflow/.local/lib/python3.12/site-packages/pyspark
-      # Fix the "Cannot find any build directories" error
-      SPARK_WORKER_DIR: /tmp/spark-work
-      SPARK_LOCAL_DIRS: /tmp/spark-local
-    command: >
-      /bin/bash -c "
-      /usr/lib/jvm/java-17-openjdk-arm64/bin/java
-      -Djava.net.preferIPv4Stack=true
-      -cp '/home/airflow/.local/lib/python3.12/site-packages/pyspark/jars/*'
-      org.apache.spark.deploy.master.Master
-      --host spark
-      --port 7077
-      --webui-port 9090"
+      SPARK_SCALA_VERSION: "2.12"
+      PYTHONPATH: /home/airflow/.local/lib/python3.12/site-packages
+      PYSPARK_PYTHON: python3
+      PYSPARK_DRIVER_PYTHON: python3
+    # Use a single-line java command — the YAML '>' block scalar joins lines
+    # with spaces which bash then mis-parses as separate commands. Using a
+    # pipe '|' block scalar preserves real newlines so bash reads the whole
+    # java invocation as one statement via the trailing backslashes.
+    command:
+      - /bin/bash
+      - -c
+      - |
+        mkdir -p /tmp/spark-work /tmp/spark-local && \
+        /usr/lib/jvm/java-17-openjdk-arm64/bin/java \
+          -Djava.net.preferIPv4Stack=true \
+          -Dspark.local.dirs=/tmp/spark-local \
+          -cp '/home/airflow/.local/lib/python3.12/site-packages/pyspark/jars/*' \
+          org.apache.spark.deploy.master.Master \
+          --host spark \
+          --port 7077 \
+          --webui-port 9090
     ports:
-      - "9090:9090" # Spark UI
+      - "9090:9090"
       - "7077:7077"
     volumes:
       - ./src:/opt/airflow/src
@@ -112,26 +145,34 @@ services:
     networks:
       - olist_network
 
+  # ── Spark worker ──────────────────────────────────────────────────────────────
   spark-worker:
     build: .
     container_name: spark-worker
     restart: always
-    entrypoint: [] # <-- Added to bypass the Airflow entrypoint
+    entrypoint: []
     environment:
-      SPARK_WORKER_CORES: 2 # Adjust based on your M4 capacity
+      SPARK_WORKER_CORES: 2
       SPARK_WORKER_MEMORY: 2G
-      SPARK_DAEMON_JAVA_OPTS: "-Djava.net.preferIPv4Stack=true"
       SPARK_HOME: /home/airflow/.local/lib/python3.12/site-packages/pyspark
-      # Fix the "Cannot find any build directories" error
-      SPARK_WORKER_DIR: /tmp/spark-work
-      SPARK_LOCAL_DIRS: /tmp/spark-local
-    command: >
-      /bin/bash -c "
-      /usr/lib/jvm/java-17-openjdk-arm64/bin/java
-      -Djava.net.preferIPv4Stack=true
-      -cp '/home/airflow/.local/lib/python3.12/site-packages/pyspark/jars/*'
-      org.apache.spark.deploy.worker.Worker
-      spark://spark:7077"
+      SPARK_SCALA_VERSION: "2.12"
+      PYTHONPATH: /home/airflow/.local/lib/python3.12/site-packages
+      PYSPARK_PYTHON: python3
+      PYSPARK_DRIVER_PYTHON: python3
+    command:
+      - /bin/bash
+      - -c
+      - |
+        mkdir -p /tmp/spark-work /tmp/spark-local && \
+        /usr/lib/jvm/java-17-openjdk-arm64/bin/java \
+          -Djava.net.preferIPv4Stack=true \
+          -Dspark.local.dirs=/tmp/spark-local \
+          -Dspark.worker.dir=/tmp/spark-work \
+          -DSPARK_SCALA_VERSION=2.12 \
+          -cp '/home/airflow/.local/lib/python3.12/site-packages/pyspark/jars/*' \
+          org.apache.spark.deploy.worker.Worker \
+          --work-dir /tmp/spark-work \
+          spark://spark:7077
     volumes:
       - ./src:/opt/airflow/src
       - ./data:/opt/airflow/data
@@ -142,8 +183,8 @@ services:
 
 networks:
   olist_network:
-    name: olist_docker_net # Explicitly named to enforce strict DNS resolution
+    name: olist_docker_net
     driver: bridge
 
 volumes:
-  postgres_data:
+  postgres_data: {}
