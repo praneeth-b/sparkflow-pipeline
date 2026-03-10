@@ -1,66 +1,162 @@
-version: '3'
+x-airflow-common:
+  &airflow-common
+  build: .
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: 46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
+    AIRFLOW__WEBSERVER__SECRET_KEY: 46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+    
+    # Strictly enforce the 'spark://' prefix. Renamed host to 'spark' to avoid hyphen DNS issues.
+    AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark://spark:7077"}'
+    
+    # Explicitly define SPARK_HOME so the Airflow worker can find the spark-submit binaries
+    SPARK_HOME: /home/airflow/.local/lib/python3.12/site-packages/pyspark
+    
+    # Force the Spark Driver (Airflow) to advertise its exact hostname to the workers
+    SPARK_LOCAL_HOSTNAME: airflow-scheduler
 
-x-spark-common: &spark-common
-  image: bitnami/spark:latest
-  volumes:
-    - ./jobs:/opt/bitnami/spark/jobs
-  networks:
-    - code-with-yu
+    # Force Java on Apple Silicon to use IPv4 for DNS resolution to prevent UnknownHostException
+    SPARK_SUBMIT_OPTS: "-Djava.net.preferIPv4Stack=true"
 
-x-airflow-common: &airflow-common
-  build:
-    context: .
-    dockerfile: Dockerfile
-  env_file:
-    - airflow.env
   volumes:
-    - ./jobs:/opt/airflow/jobs
     - ./dags:/opt/airflow/dags
-    - ./logs:/opt/airflow/logs
+    - ./src:/opt/airflow/src
+    - ./data:/opt/airflow/data
   depends_on:
-    - postgres
-  networks:
-    - code-with-yu
+    postgres:
+      condition: service_healthy
 
 services:
-  spark-master:
-    <<: *spark-common
-    command: bin/spark-class org.apache.spark.deploy.master.Master
-    ports:
-      - "9090:8080"
-      - "7077:7077"
-
-  spark-worker:
-    <<: *spark-common
-    command: bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
-    depends_on:
-      - spark-master
-    environment:
-      SPARK_MODE: worker
-      SPARK_WORKER_CORES: 2
-      SPARK_WORKER_MEMORY: 1g
-      SPARK_MASTER_URL: spark://spark-master:7077
-
+  # --- Airflow Core ---
   postgres:
-    image: postgres:14.0
+    image: postgres:13
+    container_name: postgres
+    restart: always
     environment:
-      - POSTGRES_USER=airflow
-      - POSTGRES_PASSWORD=airflow
-      - POSTGRES_DB=airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
     networks:
-      - code-with-yu
+      - olist_network
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
 
-  webserver:
+  airflow-webserver:
     <<: *airflow-common
+    container_name: airflow-webserver
+    restart: always
     command: webserver
     ports:
-      - "8080:8080"
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+    networks:
+      - olist_network
     depends_on:
-      - scheduler
+      postgres:
+        condition: service_healthy
+      spark:
+        condition: service_started
 
-  scheduler:
+  airflow-scheduler:
     <<: *airflow-common
-    command: bash -c "airflow db migrate && airflow users create --username admin --firstname Yusuf --lastname Ganiyu --role Admin --email airscholar@gmail.com --password admin && airflow scheduler"
+    container_name: airflow-scheduler
+    hostname: airflow-scheduler
+    restart: always
+    command: scheduler
+    networks:
+      - olist_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      spark:
+        condition: service_started
+
+  # --- Spark Cluster ---
+  # Renamed to "spark" (no hyphens) for bulletproof Java DNS resolution
+  spark:
+    build: .
+    container_name: spark
+    restart: always
+    environment:
+      SPARK_DAEMON_JAVA_OPTS: "-Djava.net.preferIPv4Stack=true"
+      SPARK_HOME: /home/airflow/.local/lib/python3.12/site-packages/pyspark
+    # Explicitly use Java to launch the master, avoiding Python ModuleNotFound errors
+    command: >
+      /bin/bash -c "
+      /usr/lib/jvm/java-17-openjdk-arm64/bin/java
+      -Djava.net.preferIPv4Stack=true
+      -cp '/home/airflow/.local/lib/python3.12/site-packages/pyspark/jars/*'
+      org.apache.spark.deploy.master.Master
+      --host spark
+      --port 7077
+      --webui-port 9090"
+    ports:
+      - "9090:9090" # Spark UI
+      - "7077:7077"
+    volumes:
+      - ./src:/opt/airflow/src
+      - ./data:/opt/airflow/data
+    networks:
+      - olist_network
+
+  spark-worker:
+    build: .
+    container_name: spark-worker
+    restart: always
+    environment:
+      SPARK_WORKER_CORES: 2 # Adjust based on your M4 capacity
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_DAEMON_JAVA_OPTS: "-Djava.net.preferIPv4Stack=true"
+      SPARK_HOME: /home/airflow/.local/lib/python3.12/site-packages/pyspark
+    # Explicitly use Java to launch the worker
+    command: >
+      /bin/bash -c "
+      /usr/lib/jvm/java-17-openjdk-arm64/bin/java
+      -Djava.net.preferIPv4Stack=true
+      -cp '/home/airflow/.local/lib/python3.12/site-packages/pyspark/jars/*'
+      org.apache.spark.deploy.worker.Worker
+      spark://spark:7077"
+    volumes:
+      - ./src:/opt/airflow/src
+      - ./data:/opt/airflow/data
+    networks:
+      - olist_network
+
+  spark-worker:
+    build: .
+    container_name: spark-worker
+    restart: always
+    environment:
+      SPARK_WORKER_CORES: 2 # Adjust based on your M4 capacity
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_DAEMON_JAVA_OPTS: "-Djava.net.preferIPv4Stack=true"
+      SPARK_HOME: /home/airflow/.local/lib/python3.12/site-packages/pyspark
+    # Use PySpark's official native launcher
+    command: >
+      /bin/bash -c "/home/airflow/.local/lib/python3.12/site-packages/pyspark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark:7077"
+    volumes:
+      - ./src:/opt/airflow/src
+      - ./data:/opt/airflow/data
+    depends_on:
+      - spark
+    networks:
+      - olist_network
 
 networks:
-  code-with-yu:
+  olist_network:
+    name: olist_docker_net # Explicitly named to enforce strict DNS resolution
+    driver: bridge
+
+volumes:
+  postgres_data:
