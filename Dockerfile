@@ -19,3 +19,10 @@ USER airflow
 # Copy requirements and install
 COPY requirements.txt /requirements.txt
 RUN pip install --no-cache-dir -r /requirements.txt
+
+# create symlinks so the JVM can find build resources
+RUN mkdir -p /tmp/spark-work /tmp/spark-local && \
+    chmod 777 /tmp/spark-work /tmp/spark-local
+
+# Ensure pyspark zip files are accessible
+RUN ls /home/airflow/.local/lib/python3.12/site-packages/pyspark/python/lib/

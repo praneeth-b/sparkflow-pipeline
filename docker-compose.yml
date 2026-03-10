@@ -8,13 +8,13 @@ x-airflow-common:
     AIRFLOW__CORE__FERNET_KEY: 46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
     AIRFLOW__WEBSERVER__SECRET_KEY: 46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
     AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
-    
+
     # Strictly enforce the 'spark://' prefix. Renamed host to 'spark' to avoid hyphen DNS issues.
     AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark://spark:7077"}'
-    
+
     # Explicitly define SPARK_HOME so the Airflow worker can find the spark-submit binaries
     SPARK_HOME: /home/airflow/.local/lib/python3.12/site-packages/pyspark
-    
+
     # Force the Spark Driver (Airflow) to advertise its exact hostname to the workers
     SPARK_LOCAL_HOSTNAME: airflow-scheduler
 
@@ -83,15 +83,17 @@ services:
         condition: service_started
 
   # --- Spark Cluster ---
-  # Renamed to "spark" (no hyphens) for bulletproof Java DNS resolution
   spark:
     build: .
     container_name: spark
     restart: always
+    entrypoint: [] # <-- Added to bypass the Airflow entrypoint
     environment:
       SPARK_DAEMON_JAVA_OPTS: "-Djava.net.preferIPv4Stack=true"
       SPARK_HOME: /home/airflow/.local/lib/python3.12/site-packages/pyspark
-    # Explicitly use Java to launch the master, avoiding Python ModuleNotFound errors
+      # Fix the "Cannot find any build directories" error
+      SPARK_WORKER_DIR: /tmp/spark-work
+      SPARK_LOCAL_DIRS: /tmp/spark-local
     command: >
       /bin/bash -c "
       /usr/lib/jvm/java-17-openjdk-arm64/bin/java
@@ -114,12 +116,15 @@ services:
     build: .
     container_name: spark-worker
     restart: always
+    entrypoint: [] # <-- Added to bypass the Airflow entrypoint
     environment:
       SPARK_WORKER_CORES: 2 # Adjust based on your M4 capacity
       SPARK_WORKER_MEMORY: 2G
       SPARK_DAEMON_JAVA_OPTS: "-Djava.net.preferIPv4Stack=true"
       SPARK_HOME: /home/airflow/.local/lib/python3.12/site-packages/pyspark
-    # Explicitly use Java to launch the worker
+      # Fix the "Cannot find any build directories" error
+      SPARK_WORKER_DIR: /tmp/spark-work
+      SPARK_LOCAL_DIRS: /tmp/spark-local
     command: >
       /bin/bash -c "
       /usr/lib/jvm/java-17-openjdk-arm64/bin/java
@@ -127,24 +132,6 @@ services:
       -cp '/home/airflow/.local/lib/python3.12/site-packages/pyspark/jars/*'
       org.apache.spark.deploy.worker.Worker
       spark://spark:7077"
-    volumes:
-      - ./src:/opt/airflow/src
-      - ./data:/opt/airflow/data
-    networks:
-      - olist_network
-
-  spark-worker:
-    build: .
-    container_name: spark-worker
-    restart: always
-    environment:
-      SPARK_WORKER_CORES: 2 # Adjust based on your M4 capacity
-      SPARK_WORKER_MEMORY: 2G
-      SPARK_DAEMON_JAVA_OPTS: "-Djava.net.preferIPv4Stack=true"
-      SPARK_HOME: /home/airflow/.local/lib/python3.12/site-packages/pyspark
-    # Use PySpark's official native launcher
-    command: >
-      /bin/bash -c "/home/airflow/.local/lib/python3.12/site-packages/pyspark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark:7077"
     volumes:
       - ./src:/opt/airflow/src
       - ./data:/opt/airflow/data

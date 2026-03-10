@@ -6,7 +6,7 @@ from pyspark.sql.types import StructType, StructField, StringType, IntegerType, 
 def ingest_to_bronze(spark: SparkSession, raw_path: str, bronze_path: str):
     print("--- Starting Bronze Ingestion ---")
 
-    # Define Strict Schemas to prevent pipeline corruption from bad raw files
+    # Define Strict Schemas to prevent pipeline corruption from bad raw_csv files
     schemas = {
         "orders": StructType([
             StructField("order_id", StringType(), False),
